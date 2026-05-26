@@ -35,6 +35,7 @@ Luac0re is a [mast1c0re](https://cturt.github.io/mast1c0re.html) variation that 
 * **[TheFlow](https://github.com/theofficialflow)** - Original netcontrol kernel exploit 
 * **[egycnq](https://github.com/egycnq)** - Porting netcontrol kernel exploit to Luac0re
 * **[cheburek3000](https://github.com/cheburek3000)** - Porting p2jb kernel exploit to Luac0re
+* **[ufm42](https://github.com/ufm42)** - [kexp](https://github.com/ufm42/kexp) used for PS5 post JB all-in-one shellcode
 
 ## Disclaimer
 
