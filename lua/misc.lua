@@ -303,8 +303,8 @@ end
 
 function create_socket(domain, type, protocol)
 
-    -- PS4 or PS5 below firmware 8.00 or domain = 0: use syscall directly
-    if PLATFORM == "PS4" or (PLATFORM == "PS5" and tonumber(FW_VERSION) < 8.00) or domain == AF_UNIX then
+    -- PS4 below firmware 14.00 or PS5 below firmware 8.00 or domain = 0: use syscall directly
+    if (PLATFORM == "PS4" and tonumber(FW_VERSION) < 14.00) or (PLATFORM == "PS5" and tonumber(FW_VERSION) < 8.00) or domain == AF_UNIX then
         local fd = syscall.socket(domain, type, protocol)
         if fd < 0 then
             send_notification("create_socket error: " .. get_error_string())
@@ -313,7 +313,7 @@ function create_socket(domain, type, protocol)
         return fd
     end
 
-    -- PS5 firmware 8.00+, non-zero domain: route through JIT socket path
+    -- PS4 firmware 14.00+, PS5 firmware 8.00+, non-zero domain: route through JIT socket path
     local jit_fd = jit_syscall.socket(domain, type, protocol)
     if jit_fd < 0 then
         send_notification("create_socket error: " .. jit_get_error_string())
